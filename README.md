@@ -1,70 +1,123 @@
 <div align="center">
 
+<img src="docs/assets/gh0st-sdk-hero.svg" alt="A luminous ghost trace passing through a clean worker loop" width="100%" />
+
 # 👻 gh0st SDK
 
-### Fresh workers. Clean context. Continuity that lasts.
+### One fresh worker per task. Memory that carries forward.
 
-An in-process Python SDK for dispatching ephemeral workers, carrying context through built-in OAG memory, and returning verifiable task reports.
+gh0st gives your app a local dispatcher and a clean, short-lived worker loop. Each task starts with only its prompt and relevant saved context; its transcript is discarded when the task finishes.
 
-**Use the SDK directly with your model provider. The gh0st Gateway is optional and separate.**
+**Keep the useful memory. Drop the conversation baggage.**
 
-[Install](#install) · [Quick start](#quick-start) · [Architecture](#what-lives-where) · [License](#license)
+[Why gh0st](#why-a-fresh-worker) · [How it works](#one-task-one-clean-worker) · [Quick start](#quick-start) · [OAG memory](#oag-explained) · [Boundaries](#what-the-sdk-owns)
+
+<br />
+
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![Apache 2.0](https://img.shields.io/badge/License-Apache--2.0-4C1)
+![Early development](https://img.shields.io/badge/Status-Early%20development-7C6FE8)
 
 </div>
 
 ---
 
-## Why gh0st
+## Why a fresh worker?
 
-Each task gets a fresh worker context. System-1 routes the task to a matching worker profile, the worker completes its turn, and its temporary transcript is discarded. The built-in OAG database carries approved rules and useful continuity into the next task. `Gh0stSDK` manages this lifecycle; `EphemeralWorker` is also available for integrations that prepare and execute a single worker turn directly.
+In a long-running agent conversation, yesterday’s tool output, old instructions, and the current task can all compete for space in the same model context. That makes each new turn carry history it may not need. Routing work to a specialist can also mean adding another model call just to ask, “Who should handle this?”
 
-| 👻 Ephemeral workers | 🧭 System-1 dispatch | 🧠 Built-in OAG |
-| --- | --- | --- |
-| A new execution loop for each ticket | Fast local routing to a configured worker role | SQLite memory persists after a worker exits |
-| Bounded by turn and tool-call limits | Routes task intent to worker capability | Trusted rules stay distinct from unverified references |
-| Reports status, tokens, tools, and failures | No model call needed to choose a worker | Optional secondary memory adapters are caller-selected |
+gh0st separates **task context** from **lasting memory**:
 
-## Install
+| A long-running agent thread | A gh0st worker loop |
+| --- | --- |
+| Conversation history keeps growing | A new worker context is created for each ticket |
+| Old turns travel with new requests | The worker receives the new task and selected memory only |
+| A model may be asked to choose the next specialist | Local System-1 rules route the task before a model call |
+| Continuity is tied to keeping the thread alive | Useful facts can be saved in SQLite OAG memory |
 
-```bash
-pip install gh0st-sdk
+The result is a clean start for every task without throwing away information that is worth keeping. Smaller, relevant context can improve token efficiency; actual savings depend on your prompts, memory selection, and provider.
+
+## One task, one clean worker
+
+`Gh0stSDK.run(ticket)` selects a worker profile, prepares a prompt with relevant OAG context, and creates an `EphemeralWorker`. The worker can make several model/tool calls while completing that one task. When it returns a `WorkerReport`, its conversation transcript is gone. Only the report and selected continuity records remain.
+
+```mermaid
+flowchart LR
+    taskA["Ticket A: inspect the login flow"] --> workerA["Fresh worker A"]
+    workerA --> reportA["WorkerReport A"]
+    workerA -->|"Save useful continuity"| oag[("SQLite OAG memory")]
+    workerA -->|"Discard transcript"| goneA["Worker A context ends"]
+
+    taskB["Ticket B: add login tests"] --> workerB["Fresh worker B"]
+    oag -->|"Recall matching notes and rules"| workerB
+    workerB --> reportB["WorkerReport B"]
+    workerB -->|"Discard transcript"| goneB["Worker B context ends"]
 ```
 
-The core package uses the Python standard library. It includes a direct OpenAI-compatible provider adapter; no proxy service or gh0st Gateway is required.
+There is no shared, ever-growing chat transcript between Ticket A and Ticket B. Worker B sees Ticket B plus whatever scoped records OAG recalls. This is the core loop whether gh0st is called directly, from a script, or from a larger agent framework.
+
+## System-1: choose the worker before calling a model
+
+System-1 is gh0st’s small, local routing step. You define worker profiles with cues such as keywords and ontology concepts. For each ticket, the router checks those cues, scores the matches, and chooses a profile. If nothing matches, it selects the configured default. This decision uses local rules; it does not spend a model call on worker assignment.
+
+```mermaid
+flowchart LR
+    prompt["Task prompt"] --> router["System-1 router: keywords and concepts"]
+    router -->|"Implementation cues"| code["Implementation profile"]
+    router -->|"Testing cues"| tests["Testing profile"]
+    router -->|"No strong match"| general["Default profile"]
+    code --> worker["New EphemeralWorker"]
+    tests --> worker
+    general --> worker
+    worker --> result["Task report"]
+```
+
+A profile holds the worker’s intent, model ID, instructions, and registered tools. The ticket’s capability grants filter which of those tools are exposed for that run. The model completes the work; System-1 handles the local “which worker?” decision.
+
+This is useful when an application has repeatable task types—implementation, tests, review, documentation—and wants predictable dispatch without starting every task with another model-based planner. Routing is intentionally transparent: define cues and a default, then inspect the resulting `worker_name` in the report.
+
+## OAG explained
+
+**OAG means Ontology-Augmented Generation.** In gh0st, it is a built-in SQLite memory store with records that have a scope, type, source, and optional concepts. An ontology is the vocabulary you provide for related ideas—for example, the concept `authentication` could include aliases such as `login`, `JWT`, and `token validation`.
+
+When a task arrives, OAG uses matching words and concepts to find relevant records in that task’s scope. gh0st adds the selected records to the worker prompt with their source and trust label. It is a small, inspectable continuity store—not a vector database, a hidden agent transcript, or a source of authority by itself.
+
+| OAG record | How the worker receives it |
+| --- | --- |
+| Human-approved `RULE` | `System Instructions / Constraints` |
+| Prior task `CONTINUITY` | `Retrieved Reference Context` |
+| `REFERENCE` or unapproved rule | `Retrieved Reference Context`, labeled unverified |
+| External memory hit | `Retrieved Reference Context` with its provider name, labeled unverified |
+
+Rules start untrusted. An application must explicitly approve a rule with `SQLiteOAG.approve_rule(...)` before it is injected as a system constraint. Ordinary notes and external retrievals stay reference data; they are not silently promoted into instructions.
+
+The SDK keeps its own OAG store even when you add a secondary memory source. Without the separate gh0st Gateway, you choose which secondary providers to configure; their results are supplemental and do not replace OAG.
 
 ## Quick start
 
+The project is in early development and is not yet published on PyPI. The current implementation is on the [`feat/public-sdk-core` branch](https://github.com/Judge-M/gh0st-SDK/tree/feat/public-sdk-core). Clone it and install from the checkout:
+
+```bash
+git clone -b feat/public-sdk-core https://github.com/Judge-M/gh0st-SDK.git
+cd gh0st-SDK
+python -m pip install .
+```
+
+Then connect a direct OpenAI-compatible provider and define the worker profiles your app needs:
+
 ```python
 import os
-from pathlib import Path
 
 from gh0st import (
-    FunctionTool,
+    Concept,
     Gh0stSDK,
+    Ontology,
     OpenAICompatibleProvider,
     SQLiteOAG,
     SQLiteStateLedger,
+    System1WorkerRouter,
     Ticket,
     WorkerProfile,
-)
-
-
-def find_files(query: str) -> list[str]:
-    """Replace this body with your application's bounded workspace search."""
-    return [f"Search requested for: {query}"]
-
-
-search_tool = FunctionTool(
-    name="find_files",
-    description="Search the current task workspace for relevant files.",
-    parameters={
-        "type": "object",
-        "properties": {"query": {"type": "string"}},
-        "required": ["query"],
-        "additionalProperties": False,
-    },
-    handler=find_files,
-    capability="workspace.search",
 )
 
 sdk = Gh0stSDK(
@@ -77,81 +130,64 @@ sdk = Gh0stSDK(
             name="implementer",
             intent="code implementation",
             model="provider:code-model",
-            instructions="Make the requested code change, then explain the result.",
-            keywords=("implement", "fix", "refactor", "add"),
-            tools=(search_tool,),
+            instructions="Implement the requested change and report what you did.",
+            keywords=("implement", "fix", "refactor"),
             is_default=True,
         ),
+        WorkerProfile(
+            name="tester",
+            intent="test writing",
+            model="provider:test-model",
+            concepts=("authentication",),
+        ),
     ),
+    router=System1WorkerRouter(Ontology([
+        Concept("authentication", ("login", "JWT", "token validation")),
+    ])),
     memory=SQLiteOAG(".gh0st/oag.sqlite3"),
     ledger=SQLiteStateLedger(".gh0st/state.sqlite3"),
 )
 
-ticket = Ticket(
-    prompt="Find the login handler and explain where token validation belongs.",
+report = sdk.run(Ticket(
+    prompt="Add regression tests for the JWT authentication parser.",
     scope="repo:my-service",
-    workspace_path=str(Path("./my-service").resolve()),
-    permitted_local_capabilities=("workspace.search",),
-)
-report = sdk.run(ticket)
+))
 
-print(report.status, report.worker_name, report.usage.total_tokens)
+print(report.worker_name, report.status)
 print(report.output)
 ```
 
-The ticket grants only `workspace.search`, so this worker receives only that registered tool. A later ticket gets a new transcript; relevant OAG records are retrieved and labeled in its context.
+For local tools, register Python functions on a `WorkerProfile` and grant their capability names on the ticket. The worker only receives tools allowed by that ticket. `EphemeralWorker` is also exported for integrations that prepare and run one worker turn directly.
 
-## What lives where
+## What the SDK owns
 
-```text
-Your app or agent framework
-        │ calls Gh0stSDK.run(ticket)
-        ▼
-Public SDK ── System-1 selects a worker profile
-        ├────── SQLite OAG supplies trusted rules and continuity
-        ├────── Configured tools run for the permitted capabilities
-        ├────── Configured model provider is called directly
-        └────── Ticket and WorkerReport are saved in the local ledger
+| In the public SDK | In the separate gh0st Gateway or embedding app |
+| --- | --- |
+| System-1 routing to a configured worker profile | Dynamic selection among providers, models, tools, and secondary memory services |
+| Fresh per-ticket worker context and tool loop | Provider policy and account-level financial ceilings |
+| Built-in SQLite OAG and local ticket/report ledger | Task-level cost accounting and admission policy |
+| Per-ticket capability filtering and turn/tool/output-token limits | Hosting, remote relay, and gateway operations |
 
-Optional, separate gh0st Gateway
-        └────── Dynamic model, tool, and secondary-memory routing;
-               gateway-owned budgets and provider policy
-```
+The SDK can call a configured OpenAI-compatible endpoint directly; no Gateway is required for local use. Ticket fields such as `max_cost_usd` and `gateway_allowance` are passed through as metadata. The SDK clamps output-token requests using `max_tokens_allocated`, but it does not account for provider spend.
 
-The public SDK owns **which worker handles a task** and the worker lifecycle through `System1WorkerRouter` and `EphemeralWorker`. The Gateway’s advanced resource routing answers **which model, tool, or secondary memory provider a worker turn should use**. Without that Gateway, the application configures models and tool sets directly and chooses any secondary providers explicitly.
+Tools are Python functions supplied by your application and run with the host process’s permissions. Capability filtering controls which registered functions a worker may call; it is not an operating-system sandbox. Put untrusted code or commands in an isolated execution environment.
 
-The SDK always maintains its own OAG continuity store. External memory results are supplemental and labeled as unverified reference context; they do not replace or write into the OAG database.
+## Use gh0st inside your existing stack
 
-## Use it inside existing agent products
+gh0st is a specialist execution layer, not a replacement for your outer workflow:
 
-Treat gh0st as a specialist execution tool inside the workflow you already have:
-
-- **LangGraph:** call `sdk.run(ticket)` from a graph node when the workflow reaches a repository task.
-- **CrewAI:** wrap it as a custom tool for a developer agent.
+- **LangGraph:** call `sdk.run(ticket)` from a graph node when a task needs its own worker context.
+- **CrewAI:** wrap `sdk.run(ticket)` as a custom tool for a developer agent.
 - **OpenAI Agents SDK:** expose it as a function tool or bounded specialist.
 
-The existing product owns the outer workflow. gh0st routes and runs its own ephemeral worker for the delegated task. These are integration patterns; framework-specific adapters are not bundled yet.
-
-## OAG trust model
-
-Memory records have a type, scope, concepts, source, and trust status.
-
-- Rules enter the database untrusted. Call `SQLiteOAG.approve_rule(..., approved_by=...)` after a human approves one; only then are they injected as **System Instructions / Constraints**.
-- Continuity records and retrieved references are provided as **Retrieved Reference Context**, separate from system instructions.
-- Optional secondary providers implement `SecondaryMemoryProvider`. The SDK queries only the providers supplied by the caller and tags each result with its source.
-
-## Execution and budget boundaries
-
-The SDK enforces local turn, tool-call, output-token, and explicitly granted capability limits. It claims tickets atomically and writes each worker report together with its final ticket status in one SQLite transaction. Ticket fields such as `max_cost_usd` and `gateway_allowance` are pass-through metadata; the SDK does not make financial admission decisions or account for provider spend. Without the Gateway, the embedding application owns that policy.
-
-Tools are application-supplied Python functions and run with the host process's permissions. Capability filtering limits which registered tools are exposed to a worker; it is not an operating-system sandbox. Use an isolated execution environment for untrusted commands or code.
+The existing framework keeps its workflow and decides when to delegate. gh0st selects its worker, runs the task, and returns a structured report. Framework-specific adapters are not bundled yet.
 
 ## CLI and REPL
 
 Set `GH0ST_MODEL` and `GH0ST_API_KEY` (or `OPENAI_API_KEY`), then run:
 
 ```bash
-gh0st                         # interactive session
+gh0st
 gh0st run "Summarize this project"
 gh0st run --model vendor:model "Review the API design"
 ```
