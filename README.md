@@ -157,20 +157,52 @@ print(report.worker_name, report.status)
 print(report.output)
 ```
 
-For local tools, register Python functions on a `WorkerProfile` and grant their capability names on the ticket. The worker only receives tools allowed by that ticket. `EphemeralWorker` is also exported for integrations that prepare and run one worker turn directly.
+For trusted application functions, register Python callbacks on a `WorkerProfile` and grant their capability names on the ticket. These callbacks execute with the embedding process's permissions. Use the bounded workspace capability below for model-directed repository work.
+
+## Bounded workspace execution
+
+For code tasks, give a ticket a task-scoped checkout and the `workspace.execute` capability. On Linux, gh0st exposes one `workspace_command` tool that can inspect, edit, test, lint, and make local Git changes inside that directory. Bubblewrap mounts the checkout as the only writable host directory, runs with no network namespace access, and fails closed if bubblewrap is missing. The model provider call happens outside the sandbox; the worker command cannot use the provider credentials.
+
+```mermaid
+flowchart LR
+    ticket[Ticket with workspace_path and source_commit] --> worker[Fresh EphemeralWorker]
+    worker -->|workspace.execute| isolation[Bubblewrap: no network, bounded mounts]
+    isolation -->|Only writable mount| clone[Task-scoped checkout]
+    clone -->|Diff, commands, tests| report[WorkerReport]
+    report -->|Transcript discarded| done[Worker returns to caller]
+```
+
+```python
+report = sdk.run(Ticket(
+    prompt="Refactor the parser, run its tests, and report any failures.",
+    scope="repo:my-service",
+    workspace_path="/var/tmp/gh0st/tasks/task-123",
+    source_commit="<full commit hash copied into the task checkout>",
+    permitted_local_capabilities=("workspace.execute",),
+    max_tokens_allocated=12_000,
+))
+
+print(report.status, report.diff)
+print(report.commands_executed)
+print(report.test_results, report.unresolved_failures)
+```
+
+The caller owns workspace creation and supplies an already bounded directory. The SDK checks the checkout's `HEAD` against `source_commit`, records commands and test/lint results, and returns a diff in `WorkerReport`. The built-in shell tool cannot push, write to production systems, or access the network. Configure the read-only test runtime with `GH0ST_SANDBOX_RUNTIME` when commands need packages from a virtual environment.
+
+The SDK can also run without a gateway: pass a direct compatible provider as above. In a gateway integration, Core supplies the selected model, one tool schema, trusted rules, and selected reference context; the SDK selects the worker profile, executes the bounded local turn, and returns evidence. Core remains responsible for task quotas, provider spend accounting, external grants, and secondary memory-provider routing. These packages communicate through Python contracts, not a server protocol.
 
 ## What the SDK owns
 
 | In the public SDK | In the separate gh0st Gateway or embedding app |
 | --- | --- |
 | System-1 routing to a configured worker profile | Dynamic selection among providers, models, tools, and secondary memory services |
-| Fresh per-ticket worker context and tool loop | Provider policy and account-level financial ceilings |
+| Fresh per-ticket worker context and bounded Linux workspace tool | Provider policy and account-level financial ceilings |
 | Built-in SQLite OAG and local ticket/report ledger | Task-level cost accounting and admission policy |
 | Per-ticket capability filtering and turn/tool/output-token limits | Hosting, remote relay, and gateway operations |
 
 The SDK can call a configured OpenAI-compatible endpoint directly; no Gateway is required for local use. Ticket fields such as `max_cost_usd` and `gateway_allowance` are passed through as metadata. The SDK clamps output-token requests using `max_tokens_allocated`, but it does not account for provider spend.
 
-Tools are Python functions supplied by your application and run with the host process’s permissions. Capability filtering controls which registered functions a worker may call; it is not an operating-system sandbox. Put untrusted code or commands in an isolated execution environment.
+Registered Python callbacks are trusted extensions and run with the host process’s permissions. Capability filtering controls which callbacks a worker may call; it does not sandbox their code. Model-directed shell commands should use `workspace.execute`, which runs through the Linux isolation boundary described above.
 
 ## Use gh0st inside your existing stack
 

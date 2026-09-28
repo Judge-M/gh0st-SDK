@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import platform
+import shlex
+import subprocess
 import unittest
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from unittest.mock import patch
 from uuid import uuid4
+
+import pytest
 
 from gh0st import (
     Concept,
@@ -27,6 +32,8 @@ from gh0st import (
     Usage,
     WorkerProfile,
     WorkerReport,
+    LinuxWorkspaceExecutor,
+    WorkspaceIsolationError,
 )
 
 
@@ -316,6 +323,128 @@ class Gh0stSDKTests(unittest.TestCase):
         self.assertEqual(response.content, "hello")
         self.assertEqual(response.usage.total_tokens, 3)
 
+    def test_workspace_capability_requires_a_workspace_and_isolation_runtime(self) -> None:
+        provider = FakeProvider([ModelResponse(content="done")])
+        sdk = Gh0stSDK(
+            provider=provider,
+            workers=(WorkerProfile("default", "general", "m", is_default=True),),
+            memory=SQLiteOAG(),
+            ledger=SQLiteStateLedger(),
+        )
+        with patch("gh0st.workspace.platform.system", return_value="Linux"), patch(
+            "gh0st.workspace.shutil.which", return_value=None
+        ):
+            with self.assertRaises(WorkspaceIsolationError):
+                sdk.run(
+                    Ticket(
+                        "Edit the project",
+                        workspace_path=str(Path(__file__).parent),
+                        permitted_local_capabilities=("workspace.execute",),
+                    )
+                )
+
+    def test_workspace_executor_rejects_non_absolute_workspaces(self) -> None:
+        with patch("gh0st.workspace.platform.system", return_value="Linux"), patch(
+            "gh0st.workspace.shutil.which", return_value="/usr/bin/bwrap"
+        ):
+            with self.assertRaisesRegex(ValueError, "absolute"):
+                LinuxWorkspaceExecutor("relative/workspace")
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.skipif(platform.system() != "Linux", reason="bubblewrap integration requires Linux")
+def test_bounded_worker_edits_tests_and_reports_without_mutating_source(tmp_path):
+    source = tmp_path / "source"
+    workspace = tmp_path / "task-workspace"
+    source.mkdir()
+    (source / "value.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    (source / "test_value.py").write_text(
+        "from value import value\n\ndef test_value():\n    assert value() == 2\n",
+        encoding="utf-8",
+    )
+
+    def git(*args: str, cwd: Path) -> str:
+        result = subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=True)
+        return result.stdout.strip()
+
+    git("init", "-q", cwd=source)
+    git("config", "user.name", "Test User", cwd=source)
+    git("config", "user.email", "test@example.invalid", cwd=source)
+    git("add", ".", cwd=source)
+    git("commit", "-qm", "baseline", cwd=source)
+    source_commit = git("rev-parse", "HEAD", cwd=source)
+    git("clone", "--no-hardlinks", "--", str(source), str(workspace), cwd=tmp_path)
+
+    provider = FakeProvider(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "edit",
+                        "workspace_command",
+                        {
+                            "command": "printf 'def value():\\n    return 2\\n' > value.py",
+                            "purpose": "edit",
+                        },
+                    ),
+                ),
+                usage=Usage(8, 4),
+                cost_usd=0.002,
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall("test", "workspace_command", {"command": "pytest -q", "purpose": "test"}),
+                ),
+                usage=Usage(8, 3),
+                cost_usd=0.001,
+            ),
+            ModelResponse(content="Updated the function and tests pass.", usage=Usage(8, 4)),
+        ]
+    )
+    sdk = Gh0stSDK(
+        provider=provider,
+        workers=(WorkerProfile("coder", "implementation", "fake", is_default=True),),
+        memory=SQLiteOAG(),
+        ledger=SQLiteStateLedger(),
+    )
+
+    report = sdk.run(
+        Ticket(
+            "Fix value() and run its tests",
+            scope="repo:demo",
+            workspace_path=str(workspace),
+            source_commit=source_commit,
+            permitted_local_capabilities=("workspace.execute",),
+            max_tokens_allocated=1000,
+        )
+    )
+
+    assert report.status == "completed"
+    assert report.turns == 3
+    assert len(report.commands_executed) == 2
+    assert report.test_results[0]["exit_code"] == 0
+    assert "return 2" in report.diff
+    assert report.cost_usd == pytest.approx(0.003)
+    assert (workspace / "value.py").read_text(encoding="utf-8").endswith("return 2\n")
+    assert (source / "value.py").read_text(encoding="utf-8").endswith("return 1\n")
+
+
+@pytest.mark.skipif(platform.system() != "Linux", reason="bubblewrap integration requires Linux")
+def test_bubblewrap_blocks_host_path_writes_and_network(tmp_path):
+    workspace = tmp_path / "task-workspace"
+    workspace.mkdir()
+    host_marker = tmp_path / "host-marker.txt"
+    executor = LinuxWorkspaceExecutor(str(workspace))
+
+    write_result = executor.run(f"printf escaped > {shlex.quote(str(host_marker))}", "edit")
+    network_result = executor.run(
+        "python -c 'import socket; socket.create_connection((\"1.1.1.1\", 443), timeout=2)'",
+        "test",
+    )
+
+    assert not host_marker.exists()
+    assert write_result.exit_code != 0
+    assert network_result.exit_code != 0

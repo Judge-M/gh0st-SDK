@@ -23,10 +23,17 @@ class Ticket:
 
     prompt: str
     scope: str = "default"
+    task_id: str | None = None
+    capability: str | None = None
     workspace_path: str | None = None
     source_commit: str | None = None
     permitted_local_capabilities: tuple[str, ...] = ()
     gateway_allowance: Mapping[str, Any] | None = None
+    assigned_model: str | None = None
+    system_instructions: str | None = None
+    trusted_system_rules: tuple[str, ...] = ()
+    context_slice: Mapping[str, Any] = field(default_factory=dict)
+    reference_context: tuple[Mapping[str, str], ...] = ()
     max_tokens_allocated: int | None = None
     max_cost_usd: float | None = None
     ticket_id: str = field(default_factory=lambda: str(uuid4()))
@@ -72,6 +79,7 @@ class ModelResponse:
     tool_calls: tuple[ToolCall, ...] = ()
     usage: Usage = field(default_factory=Usage)
     finish_reason: str | None = None
+    cost_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -88,3 +96,9 @@ class WorkerReport:
     warnings: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
     elapsed_ms: float = 0.0
+    cost_usd: float = 0.0
+    diff: str = ""
+    commands_executed: tuple[Mapping[str, Any], ...] = ()
+    test_results: tuple[Mapping[str, Any], ...] = ()
+    unresolved_failures: tuple[str, ...] = ()
+    child_ticket_proposals: tuple[Mapping[str, Any], ...] = ()

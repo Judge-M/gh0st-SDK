@@ -1,0 +1,39 @@
+name: Linux runtime gates
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap python3-venv
+      - name: Install SDK and test dependencies
+        run: |
+          /usr/bin/python3 -m venv --copies .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e .[dev]
+      - name: Run SDK and Linux isolation tests
+        env:
+          GH0ST_SANDBOX_RUNTIME: ${{ github.workspace }}/.venv
+        run: .venv/bin/python -m pytest -q
+      - name: Build SDK wheel
+        run: .venv/bin/python -m pip wheel . --no-deps --wheel-dir dist

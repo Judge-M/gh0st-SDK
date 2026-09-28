@@ -14,9 +14,11 @@ from .providers import CompletionProvider, OpenAICompatibleProvider, ProviderErr
 from .routing import RouteDecision, System1WorkerRouter, WorkerProfile
 from .runtime import EphemeralWorker, ExecutionLimits, Gh0stSDK, WorkerExecutionResult
 from .tools import FunctionTool
+from .workspace import CommandResult, LinuxWorkspaceExecutor, WorkspaceIsolationError
 
 __all__ = [
     "CompletionProvider",
+    "CommandResult",
     "Concept",
     "DuplicateTicketError",
     "EphemeralWorker",
@@ -41,4 +43,6 @@ __all__ = [
     "WorkerProfile",
     "WorkerExecutionResult",
     "WorkerReport",
+    "LinuxWorkspaceExecutor",
+    "WorkspaceIsolationError",
 ]
